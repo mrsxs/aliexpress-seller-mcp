@@ -11,7 +11,8 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { assertFileId } from '../lib/aliexpress.mjs';
 import { withBrowserLock } from '../lib/browser-lock.mjs';
-import { BUYER_SITE, SELLER_SITE, createBrowserSession } from '../lib/browser.mjs';
+import { BUYER_SITE, PageBlockedError, SELLER_SITE, createBrowserSession } from '../lib/browser.mjs';
+import { CooldownError, createCooldown, isVerifyMessage, optional } from '../lib/cooldown.mjs';
 import { ImageInputError, loadImage } from '../lib/image-input.mjs';
 import { findCategory, loadCategories, marketOverview, searchCategories, searchWords, WORD_ORDER } from '../lib/market.mjs';
 import { computeNextRun, createMonitor } from '../lib/monitor.mjs';
@@ -20,7 +21,9 @@ import { listProducts, PRODUCT_TABS } from '../lib/products.mjs';
 import { DEFAULT_REGIONS, validateRegions } from '../lib/regions.mjs';
 import { EVENT_TYPES, PRICE_NOTE, QueryError, changeEvents, latestPrices, listWatches, priceHistory, resolveWatch, summarizeRegions } from '../lib/scout-query.mjs';
 import { collectImageSearch } from '../lib/search-runner.mjs';
-import { assertDate, createSellerApi, PERIODS, resolveRange, SellerError, sellerContext, SHOP_MODELS } from '../lib/seller.mjs';
+import {
+  assertDate, CHANNEL_READ_FAILED, contextStale, createSellerApi, PERIODS, resolveRange, SellerError, sellerContext, SHOP_MODELS,
+} from '../lib/seller.mjs';
 import { ShopConfigError, parseShops, resolveShop } from '../lib/shops.mjs';
 import { latestStatDate, productAnalysis, productRank, RANK_BY, SOURCE_PLATFORMS, storeOverview, storeToday, storeTrend, trafficSources } from '../lib/store-data.mjs';
 import { validateWatchPatch } from '../lib/watch-validate.mjs';
@@ -59,9 +62,29 @@ const exclusive = (fn) => {
   return run;
 };
 
-const collect = (input) => exclusive(() => collectImageSearch(sessionFor(BUYER_SITE, input.storeId), input));
+// 某家店触发速卖通安全验证后冷却 10 分钟（买家前台、卖家后台共用；记在数据目录，别的进程也看得到）
+const cooldown = createCooldown({ dir: DATA_DIR });
+const shopLabel = (storeId) => SHOPS.find((s) => s.storeId === storeId) ?? { storeId, name: storeId };
+const noteIfVerify = (shop, err) => {
+  if (isVerifyMessage(err?.message)) cooldown.note(shop, err);
+};
+
+const collect = (input) => exclusive(async () => {
+  const shop = shopLabel(input.storeId);
+  cooldown.check(shop);
+  try {
+    return await collectImageSearch(sessionFor(BUYER_SITE, input.storeId), input);
+  } catch (err) {
+    noteIfVerify(shop, err);
+    throw err;
+  }
+});
 // 监控只借用 runWatch（立即跑一轮）；定时由调用方（如定时任务）负责，这里不启动定时器
-const monitor = createMonitor({ store, runSearch: ({ storeId, fileId, regions }) => collect({ storeId, fileId, regions, image: null }), notify: () => {} });
+const monitor = createMonitor({
+  store, runSearch: ({ storeId, fileId, regions }) => collect({ storeId, fileId, regions, image: null }), notify: () => {},
+  // 同一个监控同一时间只跑一轮（跨进程）；另一个进程正在跑就很快放弃
+  withRunLock: (id, fn) => withBrowserLock(DATA_DIR, fn, { owner: `aliexpress-seller-mcp ${process.pid} 监控 ${id}`, key: `watch:${id}`, waitMs: 5_000 }),
+});
 
 // 店铺上下文（channelId、经营模式）和最新出数日期缓存 10 分钟
 const CTX_TTL_MS = 10 * 60_000;
@@ -75,16 +98,23 @@ const cached = async (map, key, load) => {
   return value;
 };
 
-const isUserError = (err) => err instanceof QueryError || err instanceof SellerError || err instanceof ShopConfigError || err instanceof ImageInputError;
+const isUserError = (err) => err instanceof QueryError || err instanceof SellerError || err instanceof ShopConfigError || err instanceof ImageInputError
+  || err instanceof CooldownError || err instanceof PageBlockedError;
 
 /** 在某家店的卖家后台里执行：fn({ call, ctx, latest }) */
 async function withSeller(shopRef, fn) {
   const shop = shopFor(shopRef);
   return exclusive(async () => {
+    cooldown.check(shop);
     const session = sessionFor(SELLER_SITE, shop.storeId);
     try {
       const cdp = await session.connect(shop.storeId);
-      const ctx = await cached(ctxCache, shop.storeId, () => sellerContext(cdp));
+      // 用户可能在同一个浏览器里切了后台店铺：页面当前的 channel 和缓存的不一样就重取店铺上下文
+      const raw = await cdp.evaluate("(window.mtopConfig && window.mtopConfig.queryStringParameters && window.mtopConfig.queryStringParameters['__channel-id__']) || ''", 5000).catch(() => CHANNEL_READ_FAILED);
+      const pageChannel = raw === CHANNEL_READ_FAILED ? null : String(raw ?? '');
+      const hit = ctxCache.get(shop.storeId);
+      if (hit && contextStale(hit.value.pageChannel, raw)) ctxCache.delete(shop.storeId);
+      const ctx = await cached(ctxCache, shop.storeId, async () => ({ ...(await sellerContext(cdp)), pageChannel }));
       const call = createSellerApi(cdp, ctx);
       // fresh=true：太平洋时间刚过零点时缓存的「最新日期」可能旧了，被拒前重取一次
       const latest = (fresh = false) => {
@@ -94,6 +124,7 @@ async function withSeller(shopRef, fn) {
       const out = await fn({ call, ctx, latest });
       return { shop: shop.name, store_name: ctx.shopName, shop_model: SHOP_MODELS[ctx.shopModel] ?? ctx.shopModel, ...out };
     } catch (err) {
+      noteIfVerify(shop, err);
       if (!(err instanceof QueryError)) ctxCache.delete(shop.storeId);
       if (!isUserError(err)) session.reset();
       throw err;
@@ -139,17 +170,30 @@ async function searchNow(a) {
   };
 }
 
+/** 监控 ID：w + 毫秒时间 + 3 位随机数（同一毫秒并发创建也基本不撞；撞了由排他建目录发现） */
+const newWatchId = (now) => `w${now}${String(Math.floor(Math.random() * 1000)).padStart(3, '0')}`;
+
 async function createWatch(a) {
   const fileId = userInput(() => assertFileId(a.file_id));
   // 先读图片：读失败时不能留下一个已经建好的监控
   const image = a.image ? await loadImage(a.image) : null;
   const now = Date.now();
   const base = {
-    id: `w${now}`, storeId: shopFor(a.shop).storeId, fileId, createdAt: now, createdBy: 'MCP',
+    id: newWatchId(now), storeId: shopFor(a.shop).storeId, fileId, createdAt: now, createdBy: 'MCP',
     enabled: true, notify: true, startAt: null, lastRunAt: null, lastStatus: '', lastError: '', snapshotCount: 0,
     ...userInput(() => validateWatchPatch({ name: a.name, intervalMin: a.interval_min ?? 60, regions: a.regions ?? ['US', 'DE', 'GB'] }, { partial: false })),
   };
-  const watch = await store.saveWatch({ ...base, nextRunAt: computeNextRun(base, now) });
+  // ID 撞了（同一毫秒并发创建）就换一个：saveWatch 排他建目录，不会覆盖已有监控
+  let watch;
+  for (let i = 0; ; i++) {
+    try {
+      watch = await store.saveWatch({ ...base, nextRunAt: computeNextRun(base, now) });
+      break;
+    } catch (err) {
+      if (err.code !== 'EEXIST' || i >= 4) throw err;
+      base.id = newWatchId(now);
+    }
+  }
   if (image) await store.saveImage(watch.id, image);
   return { watch: { id: watch.id, name: watch.name, store_id: watch.storeId, regions: watch.regions, interval_min: watch.intervalMin },
     next: '用 ae_watch_run 立即跑第一轮；之后按间隔定时调用 ae_watch_run。' };
@@ -206,9 +250,19 @@ const analysis = (a) => withSeller(a.shop, async ({ call, ctx, latest }) => {
     note: `${RANGE_NOTE}keywords：买家搜哪些词看到 / 买了这个商品（exposure 搜索曝光，visitors 词引导访客）；countries 第一行是全部国家合计；sources 分 APP / 非 APP。` };
 });
 
-const orders = (a) => withSeller(a.shop, async ({ call, ctx }) => {
+const orders = (a) => {
+  const page = a.page ?? 1;
+  const pageSize = a.page_size ?? 20;
+  // 后台列表最多翻到 5000 条：超出的页直接说明，不去请求
+  if ((page - 1) * pageSize >= 5000) throw new QueryError(`订单列表最多翻到第 5000 条（page × page_size）：page_size=${pageSize} 时 page 最大 ${Math.ceil(5000 / pageSize)}`);
+  return ordersInBrowser(a);
+};
+
+const ordersInBrowser = (a) => withSeller(a.shop, async ({ call, ctx }) => {
   const opts = { status: a.status ?? 'all', orderType: a.order_type ?? 'all', page: a.page ?? 1, pageSize: a.page_size ?? 20, orderId: a.order_id };
-  const [list, counts] = await Promise.all([listOrders(call, ctx, opts), orderCounts(call, ctx)]);
+  // 一个接一个发；计数拿不到不影响列表，但安全验证 / 登录失效要整体停下
+  const list = await listOrders(call, ctx, opts);
+  const counts = await optional(orderCounts(call, ctx), (err) => ({ error: `计数没取到：${err.message}` }));
   return { status: ORDER_STATUS[opts.status][1], order_type: ORDER_TYPES[opts.orderType], ...list, counts,
     note: '下单时间是美国太平洋时间；列表最多翻到 5000 条（后台限制）。买家名不输出。counts 是订单看板的待办计数。' };
 });
