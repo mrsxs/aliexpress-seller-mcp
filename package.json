@@ -1,6 +1,6 @@
 {
   "name": "aliexpress-seller-mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "AliExpress seller MCP server: store analytics (生意参谋), orders, products, market & search-word data and image-search price comparison, read through the seller's own logged-in Ziniao (紫鸟) store browser — no Open Platform app key needed.",
   "keywords": [
     "mcp",
