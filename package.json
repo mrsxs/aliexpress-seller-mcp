@@ -1,0 +1,34 @@
+{
+  "name": "aliexpress-seller-mcp",
+  "version": "1.0.0",
+  "description": "AliExpress seller MCP server: store analytics (生意参谋), orders, products, market & search-word data and image-search price comparison, read through the seller's own logged-in Ziniao (紫鸟) store browser — no Open Platform app key needed.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "aliexpress",
+    "aliexpress-seller",
+    "ziniao",
+    "accio"
+  ],
+  "homepage": "https://github.com/mrsxs/aliexpress-seller-mcp#readme",
+  "bugs": "https://github.com/mrsxs/aliexpress-seller-mcp/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mrsxs/aliexpress-seller-mcp.git"
+  },
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "aliexpress-seller-mcp": "bin/aliexpress-seller-mcp.mjs"
+  },
+  "files": [
+    "bin/",
+    "lib/"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}
