@@ -138,7 +138,7 @@ test('MCP：握手、工具列表、调用、参数错误', async () => {
     child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
     const listed = (await rpc('tools/list', {})).result.tools;
     assert.deepEqual(listed.map((t) => t.name), ['ae_shops', 'ae_store_overview', 'ae_store_trend', 'ae_store_today', 'ae_traffic_sources', 'ae_product_rank',
-      'ae_product_analysis', 'ae_orders', 'ae_products', 'ae_categories', 'ae_market_overview', 'ae_search_words',
+      'ae_product_analysis', 'ae_orders', 'ae_products', 'ae_low_stock', 'ae_categories', 'ae_market_overview', 'ae_search_words',
       'ae_search', 'ae_watch_create', 'ae_watch_run', 'ae_watches', 'ae_latest', 'ae_history', 'ae_events']);
     // 只有监控的两个工具写本机数据，其余全部只读
     assert.deepEqual(listed.filter((t) => !t.annotations.readOnlyHint).map((t) => t.name), ['ae_watch_create', 'ae_watch_run']);

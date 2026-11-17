@@ -5,10 +5,10 @@ import { spawn } from 'node:child_process';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { lockPort, whoHolds, withBrowserLock } from '../lib/browser-lock.mjs';
 
-const LOCK = fileURLToPath(new URL('../lib/browser-lock.mjs', import.meta.url));
+// 子进程里 import 用 file:// URL（Windows 的 D:\ 路径会被 ESM 当成未知协议）
+const LOCK = new URL('../lib/browser-lock.mjs', import.meta.url).href;
 // 每个测试用自己的数据目录（锁端口由目录算出来）
 const made = [];
 const dirFor = (name) => {

@@ -19,6 +19,7 @@ import { computeNextRun, createMonitor } from '../lib/monitor.mjs';
 import { listOrders, orderCounts, ORDER_STATUS, ORDER_TYPES, PAGE_SIZES } from '../lib/orders.mjs';
 import { listProducts, PRODUCT_TABS } from '../lib/products.mjs';
 import { DEFAULT_REGIONS, validateRegions } from '../lib/regions.mjs';
+import { attachStock, queryStock, SCAN_BUDGET_MS, scanLowStock, STOCK_TYPES } from '../lib/stock.mjs';
 import { EVENT_TYPES, PRICE_NOTE, QueryError, changeEvents, latestPrices, listWatches, priceHistory, resolveWatch, summarizeRegions } from '../lib/scout-query.mjs';
 import { collectImageSearch } from '../lib/search-runner.mjs';
 import {
@@ -267,12 +268,36 @@ const ordersInBrowser = (a) => withSeller(a.shop, async ({ call, ctx }) => {
     note: '下单时间是美国太平洋时间；列表最多翻到 5000 条（后台限制）。买家名不输出。counts 是订单看板的待办计数。' };
 });
 
+// 一次扫描要翻页再分批查库存：请求之间稍停，别连着打
+const pacing = () => new Promise((r) => setTimeout(r, 400 + Math.random() * 400));
+
 const products = (a) => withSeller(a.shop, async ({ call, ctx }) => {
   const tab = a.tab ?? 'online_product';
-  const out = await listProducts(call, ctx, { tab, page: a.page ?? 1, pageSize: a.page_size ?? 20, skus: a.include_skus === true });
+  const withStock = a.include_stock === true;
+  const out = await listProducts(call, ctx, { tab, page: a.page ?? 1, pageSize: a.page_size ?? 20, skus: a.include_skus === true || withStock });
+  if (withStock && out.products.length) out.products = attachStock(out.products, await queryStock(call, out.products.map((p) => p.product_id)));
   return { tab: PRODUCT_TABS[tab], page: a.page ?? 1, ...out,
-    note: 'month_* 是商品管理页给的近 30 天数据；半托管商品用 choice_* 标签页，全托管店用 online_product 等普通标签页。' };
+    note: 'month_* 是商品管理页给的近 30 天数据；半托管商品用 choice_* 标签页，全托管店用 online_product 等普通标签页。'
+      + (withStock ? '库存是可售件数：stock 各仓合计，stock_jit JIT 仓（半托管 JIT 备货），stock_seller 商家仓，stock_warehouse 优选仓（仓发）；没有这类仓就没有这个字段。' : '库存要加 include_stock=true。') };
 });
+
+const lowStock = (a) => {
+  // 截止时间从调用时算起：排队等浏览器、打开店铺都算在客户端的 120 秒里；
+  // 到点就返回（排队 / 打开浏览器卡住也一样），还没开始的扫描到点后不再开始
+  const deadline = Date.now() + SCAN_BUDGET_MS;
+  const work = withSeller(a.shop, async ({ call, ctx }) => {
+  if (Date.now() > deadline - 3_000) throw new SellerError('等浏览器 / 打开店铺用了太久，已超过时限，请稍后重试');
+  const out = await scanLowStock(call, ctx, { type: a.stock_type ?? 'jit', below: a.below ?? 5, limit: a.limit ?? 200, pause: pacing, deadline });
+  return { ...out,
+    note: `stock 是所选库存（${out.stock_type}）的可售件数，低于 ${out.below} 的 SKU 按从少到多排；jit / seller / warehouse / total 是这个 SKU 各类库存，null = 没有这类仓。`
+      + '只看在售商品（正在销售 + 半托管·正在销售）；SKU 没有所选那类仓的不算。'
+      + (out.truncated ? `只列出前 ${out.rows.length} 个，加大 limit 看全部。` : '') };
+  });
+  work.catch(() => {}); // 到点先返回后，后台这个任务的报错不再关心
+  let timer;
+  const late = new Promise((_, reject) => { timer = setTimeout(() => reject(new SellerError('等浏览器 / 打开店铺用了太久，已超过时限，请稍后重试')), deadline - Date.now() + 2_000); });
+  return Promise.race([work, late]).finally(() => clearTimeout(timer));
+};
 
 const categoryOf = async (call, ctx, id) => {
   const cat = findCategory(await loadCategories(call, ctx), id);
@@ -313,7 +338,7 @@ const shops = () => {
 const INSTRUCTIONS = '速卖通卖家数据（通过本机紫鸟店铺浏览器里已登录的卖家后台取数，不走开放平台，只读）。'
   + '店铺经营：ae_store_overview（支付金额 / 买家 / 转化 / 访客等核心指标，单日或近 7 / 30 天，带环比）、ae_store_trend（近 30 天每日）、ae_store_today（今天实时）、'
   + 'ae_traffic_sources（流量来源）、ae_product_rank（商品排行）、ae_product_analysis（单品：搜索词 / 国家 / 来源）。'
-  + '订单 ae_orders，商品 ae_products。市场：ae_categories 查类目 ID → ae_market_overview（类目大盘）、ae_search_words（类目热搜词）。'
+  + '订单 ae_orders，商品 ae_products（include_stock 带各仓库存），库存预警 ae_low_stock（全店在售商品里 JIT / 商家仓 / 优选仓库存低于阈值的 SKU）。市场：ae_categories 查类目 ID → ae_market_overview（类目大盘）、ae_search_words（类目热搜词）。'
   + '竞品比价：ae_search 用商品图在买家前台按国家图搜；长期跟踪 ae_watch_create + 定时 ae_watch_run，查询 ae_watches / ae_latest / ae_history / ae_events。'
   + '多店铺：ae_shops 列出已配置的店，其他工具用 shop 参数选店（店铺名或紫鸟店铺 ID），比较多家店时逐店调用。'
   + '生意参谋日期是美国太平洋时间，最新通常到昨天；全托管店没有订单接口。';
@@ -396,15 +421,29 @@ const TOOLS = [
   },
   {
     name: 'ae_products',
-    description: '商品列表（卖家后台商品管理）：价格区间、库存、近 30 天销量 / 访客 / 曝光 / 支付金额 / 转化、类目、分组、参加的活动，可选 SKU 明细；附各标签页数量。',
+    description: '商品列表（卖家后台商品管理）：价格区间、近 30 天销量 / 访客 / 曝光 / 支付金额 / 转化、类目、分组、参加的活动，可选 SKU 明细和各仓库存（JIT / 商家仓 / 优选仓）；附各标签页数量。',
     annotations: BROWSER_RO,
     inputSchema: obj({
       shop: shopArg,
       tab: { type: 'string', enum: Object.keys(PRODUCT_TABS), default: 'online_product', description: Object.entries(PRODUCT_TABS).map(([k, v]) => `${k} ${v}`).join(' / ') },
       page: pageArg, page_size: { type: 'integer', minimum: 1, maximum: 50, default: 20 },
-      include_skus: { type: 'boolean', default: false, description: '附每个 SKU 的编码、价格、库存、属性' },
+      include_skus: { type: 'boolean', default: false, description: '附每个 SKU 的编码、价格、属性' },
+      include_stock: { type: 'boolean', default: false, description: '附库存（会带上 SKU）：商品总库存，每个 SKU 的 JIT 仓 / 商家仓 / 优选仓可售件数；多一次请求' },
     }),
     run: products,
+  },
+  {
+    name: 'ae_low_stock',
+    description: '库存预警：扫描店铺全部在售商品（正在销售 + 半托管·正在销售），按 SKU 列出某类库存低于阈值的（默认 JIT 库存 < 5），带商品标题、SKU 编码、规格和各仓库存，附扫描数量和命中数。'
+      + '每 50 个商品一次请求，几百个商品约半分钟；100 秒内扫不完（约一千个以上在售商品）会停下说明，改用 ae_products 加 include_stock 分页查。',
+    annotations: BROWSER_RO,
+    inputSchema: obj({
+      shop: shopArg,
+      stock_type: { type: 'string', enum: Object.keys(STOCK_TYPES), default: 'jit', description: Object.entries(STOCK_TYPES).map(([k, v]) => `${k} ${v}`).join(' / ') },
+      below: { type: 'integer', minimum: 1, maximum: 1000000, default: 5, description: '低于这个数（不含）算低库存' },
+      limit: { type: 'integer', minimum: 1, maximum: 2000, default: 200, description: '最多列出多少个 SKU' },
+    }),
+    run: lowStock,
   },
   {
     name: 'ae_categories',

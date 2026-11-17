@@ -52,6 +52,31 @@ test('令牌过期：用服务端下发的新令牌重签一次', async () => {
   assert.equal(sign2, h5Sign('new', t2, 'k', '{}'));
 });
 
+test('调用方已取消：令牌过期后不再重试，也不发新请求', async () => {
+  const ac = new AbortController();
+  const cdp = fakeCdp([
+    { reply: { status: 200, text: JSON.stringify({ ret: ['FAIL_SYS_TOKEN_EXOIRED::令牌过期'] }) }, setCookie: '_m_h5_tk=new_2' },
+    { reply: { status: 200, text: JSON.stringify({ ret: ['SUCCESS::调用成功'], data: {} }) } },
+  ]);
+  const p = mtopFetch(cdp, { api: 'm.x', appKey: 'k', data: {}, signal: ac.signal });
+  ac.abort();
+  await assert.rejects(p, (e) => e instanceof MtopError && /已取消/.test(e.message));
+  assert.ok(cdp.sent.length <= 1);
+  await assert.rejects(mtopFetch(fakeCdp([]), { api: 'm.y', appKey: 'k', data: {}, signal: ac.signal }), /已取消/);
+
+  // 读 cookie 的时候被取消：读完也不能再发请求
+  const ac2 = new AbortController();
+  const slow = fakeCdp([{ reply: { status: 200, text: JSON.stringify({ ret: ['SUCCESS::调用成功'], data: {} }) } }]);
+  let release;
+  slow.evaluate = () => new Promise((r) => { release = () => r('_m_h5_tk=old_1'); });
+  const p2 = mtopFetch(slow, { api: 'm.z', appKey: 'k', data: {}, signal: ac2.signal });
+  await new Promise((r) => setImmediate(r));
+  ac2.abort();
+  release();
+  await assert.rejects(p2, /已取消/);
+  assert.equal(slow.sent.length, 0);
+});
+
 test('失败：业务错误、非 JSON、页面 fetch 出错都抛 MtopError，令牌只重试一次', async () => {
   await assert.rejects(mtopFetch(fakeCdp([{ reply: { status: 200, text: JSON.stringify({ ret: ['FAIL_BIZ::不行'] }) } }]), { api: 'm.x', appKey: 'k' }), (e) => e instanceof MtopError && /FAIL_BIZ/.test(e.message));
   await assert.rejects(mtopFetch(fakeCdp([{ reply: { status: 502, text: '<html>' } }]), { api: 'm.x', appKey: 'k' }), /不是 JSON（HTTP 502）/);
